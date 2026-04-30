@@ -5,7 +5,15 @@ Two scripts that pair together:
 1. **`scan_alerts.py`** — polls Gmail for Campflare permit-found alerts, parses them, and emits a JSON payload.
 2. **`book_permit.py`** — takes that payload, drives recreation.gov to the cart for the right permit/date, and stops before payment so a human commits.
 
-> Recreation.gov ToS likely prohibits automated booking. The booking script intentionally stops at the cart so the final click is yours.
+## Disclaimer
+
+Not affiliated with or endorsed by recreation.gov, Campflare, or the National Park Service. Recreation.gov's terms of service likely prohibit automated booking, and operators monitor traffic — running this aggressively (parallel instances, tight polling loops, headless-without-pacing) **can get your account terminated**. This project intentionally:
+
+- Stops at the cart so the final commit (payment) is a human action.
+- Runs one instance at a time per alert.
+- Pre-checks availability via the public read-only API before launching a browser, so a stale alert doesn't trigger a session.
+
+Use at your own risk for personal, occasional use.
 
 ## Setup
 

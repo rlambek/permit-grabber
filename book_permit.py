@@ -9,7 +9,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
+import re
 import sys
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 
@@ -17,6 +21,17 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_pl
 
 AUTH_STATE = Path("auth.json")
 REQUIRED_FIELDS = ("permit_name", "permit_url", "date", "group_size")
+
+# A small rotation of recent Chrome UAs. Matching the User-Agent the website itself
+# expects avoids the most obvious "automation tool" fingerprint without doing anything
+# evasive — same approach camply uses for its API calls.
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+PERMIT_ID_RE = re.compile(r"/permits/(\d+)")
 
 
 def load_alert(args) -> dict:
@@ -51,10 +66,10 @@ def login_if_needed(page: Page):
         return
 
     page.get_by_role("button", name="Log In").first.click()
-    # TODO: verify selector — recreation.gov uses a modal with email/password fields.
-    page.get_by_label("Email Address").fill(email)
-    page.get_by_label("Password").fill(password)
-    page.get_by_role("button", name="Log In").last.click()
+    # Selectors confirmed via rmccrystal/recreation-gov-bot, which is a working Selenium bot.
+    page.locator("#email").fill(email)
+    page.locator("#rec-acct-sign-in-password").fill(password)
+    page.locator("#rec-acct-sign-in-password").press("Enter")
 
     # Wait for either the modal to close or an MFA/CAPTCHA prompt.
     try:
@@ -125,10 +140,63 @@ def click_book(page: Page):
     raise RuntimeError("could not find a Book/Reserve/Continue button on the page")
 
 
-def run(alert: dict, headless: bool):
+def precheck_availability(permit_url: str, iso_date: str) -> bool | None:
+    """Hit the public recreation.gov availability API to see if the date is still open.
+
+    Returns True if the date appears available, False if confirmed unavailable, or None
+    if we couldn't tell (unknown URL shape, network error, schema drift). Callers should
+    treat None as "proceed anyway" — the precheck is a cheap fast-fail, not a gate.
+    """
+    match = PERMIT_ID_RE.search(permit_url)
+    if not match:
+        return None
+    permit_id = match.group(1)
+    target = date.fromisoformat(iso_date)
+    month_start = target.replace(day=1).strftime("%Y-%m-%dT00:00:00.000Z")
+    api_url = (
+        f"https://www.recreation.gov/api/permits/{permit_id}/availability/month"
+        f"?start_date={month_start}"
+    )
+    req = urllib.request.Request(api_url, headers={"User-Agent": random.choice(USER_AGENTS), "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read())
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        return None
+
+    # The payload shape varies by permit type. Look for any "remaining > 0" entry on the
+    # target date across any division. If we can't find a date-keyed structure at all,
+    # bail out (None) rather than guess.
+    iso = target.isoformat()
+    divisions = payload.get("payload", {}).get("availability", {}) or payload.get("availability", {})
+    if not isinstance(divisions, dict) or not divisions:
+        return None
+    for div in divisions.values():
+        date_map = (div or {}).get("date_availability") or {}
+        for key, entry in date_map.items():
+            if key.startswith(iso) and isinstance(entry, dict):
+                remaining = entry.get("remaining")
+                if isinstance(remaining, (int, float)) and remaining > 0:
+                    return True
+    return False
+
+
+def run(alert: dict, headless: bool, skip_precheck: bool):
+    if not skip_precheck:
+        available = precheck_availability(alert["permit_url"], alert["date"])
+        if available is False:
+            print(f"precheck: {alert['permit_name']} on {alert['date']} appears unavailable — aborting before launching browser")
+            return
+        if available is None:
+            print("precheck: could not determine availability, proceeding anyway")
+        else:
+            print("precheck: availability confirmed, launching browser")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        context_kwargs = {"storage_state": str(AUTH_STATE)} if AUTH_STATE.exists() else {}
+        context_kwargs = {"user_agent": random.choice(USER_AGENTS)}
+        if AUTH_STATE.exists():
+            context_kwargs["storage_state"] = str(AUTH_STATE)
         context = browser.new_context(**context_kwargs)
         page = context.new_page()
 
@@ -161,10 +229,11 @@ def main():
     src.add_argument("--alert", help="Alert payload as a JSON string")
     src.add_argument("--alert-stdin", action="store_true", help="Read JSON alert from stdin")
     parser.add_argument("--headless", action="store_true", help="Run browser hidden (default: headed)")
+    parser.add_argument("--no-precheck", action="store_true", help="Skip the public-API availability check")
     args = parser.parse_args()
 
     alert = load_alert(args)
-    run(alert, headless=args.headless)
+    run(alert, headless=args.headless, skip_precheck=args.no_precheck)
 
 
 if __name__ == "__main__":
