@@ -110,7 +110,9 @@ def select_segment(page: Page, segment: str | None):
         try:
             elem.select_option(label=segment)
             return
-        except PlaywrightTimeout:
+        except Exception:
+            # select_option raises Playwright's Error class (not TimeoutError) on no-match,
+            # so we catch broadly and fall through to substring matching.
             pass
         options = elem.locator("option").all_inner_texts()
         for opt in options:
@@ -123,15 +125,24 @@ def select_segment(page: Page, segment: str | None):
     page.get_by_text(segment).first.click()
 
 
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_MONTHS = ["January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December"]
+
+
 def select_date(page: Page, iso_date: str):
     target = date.fromisoformat(iso_date)
+    weekday = _WEEKDAYS[target.weekday()]
+    month = _MONTHS[target.month - 1]
     # Recreation.gov permit pages use an inline calendar grid — no date <input>, no picker
-    # trigger button. We advance the visible month, then click the day cell.
-    target_header = target.strftime("%B %Y")
+    # trigger button. Scope the Next-month button to the calendar so we don't accidentally
+    # click image-gallery / carousel "Next" controls on the page.
+    target_header = f"{month} {target.year}"
+    calendar = page.locator('[role="grid"]').first
+    next_btn = calendar.get_by_role("button", name="Next") if calendar.count() else page.get_by_role("button", name="Next")
     for _ in range(24):
         if page.get_by_text(target_header, exact=True).count() > 0:
             break
-        next_btn = page.get_by_role("button", name="Next")
         if next_btn.count() == 0:
             break
         next_btn.first.click()
@@ -139,9 +150,8 @@ def select_date(page: Page, iso_date: str):
 
     # Day buttons have aria-labels like "Sunday, August 16, 2026 - 5 left" or
     # "...- Unavailable" or "Today, ...". Match the date prefix and ignore the suffix.
-    day_pattern = re.compile(
-        rf"^(?:Today, )?{target.strftime('%A')}, {target.strftime('%B')} {target.day}, {target.year}\b"
-    )
+    # Hardcoded English weekday/month avoids Windows locale surprises.
+    day_pattern = re.compile(rf"^(?:Today, )?{weekday}, {month} {target.day}, {target.year}\b")
     cell = page.get_by_role("button", name=day_pattern)
     cell.first.click()
 
@@ -155,6 +165,10 @@ def set_group_size(page: Page, group_size: int):
         if field.count() > 0:
             field.first.fill(str(group_size))
             return
+    raise RuntimeError(
+        f"Could not find a group-size input on the page (expected group_size={group_size}). "
+        "Refusing to silently book with the default size."
+    )
 
 
 def click_book(page: Page):
@@ -162,9 +176,12 @@ def click_book(page: Page):
         btn = page.get_by_role("button", name=label)
         if btn.count() > 0 and btn.first.is_enabled():
             btn.first.click()
-            # networkidle never settles on recreation.gov — domcontentloaded is enough
-            # to know the cart page swapped in, and the email send doesn't need more.
-            page.wait_for_load_state("domcontentloaded")
+            # networkidle never settles on recreation.gov. Wait for the cart/checkout URL
+            # specifically so page.url is the cart link before we email it.
+            try:
+                page.wait_for_url(re.compile(r"/(cart|checkout|reservation)"), timeout=15000)
+            except PlaywrightTimeout:
+                page.wait_for_load_state("domcontentloaded")
             return
     raise RuntimeError("could not find a Book/Reserve/Continue button on the page")
 
