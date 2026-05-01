@@ -136,14 +136,14 @@ def select_date(page: Page, iso_date: str):
     weekday = _WEEKDAYS[target.weekday()]
     month = _MONTHS[target.month - 1]
     # Recreation.gov permit pages use an inline calendar grid — no date <input>, no picker
-    # trigger button. Scope the Next-month button to the calendar so we don't accidentally
-    # click image-gallery / carousel "Next" controls on the page.
+    # trigger button. We advance the visible month, then click the day cell. The image
+    # gallery's nav buttons use specific aria-labels ("Image N of M..."), so a plain "Next"
+    # match reliably hits the calendar's nav button.
     target_header = f"{month} {target.year}"
-    calendar = page.locator('[role="grid"]').first
-    next_btn = calendar.get_by_role("button", name="Next") if calendar.count() else page.get_by_role("button", name="Next")
     for _ in range(24):
         if page.get_by_text(target_header, exact=True).count() > 0:
             break
+        next_btn = page.get_by_role("button", name="Next")
         if next_btn.count() == 0:
             break
         next_btn.first.click()
@@ -259,11 +259,11 @@ def run(alert: dict, headless: bool, skip_precheck: bool, unattended: bool):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, args=LAUNCH_ARGS)
-        # Realistic context: full-HD viewport, US English, Mountain time (Yampa is in CO),
-        # explicit Accept-Language header. These eliminate easy fingerprint mismatches.
+        # Realistic context: US English, Mountain time (Yampa is in CO), explicit
+        # Accept-Language. Skip an explicit viewport — Playwright's default plays nicely
+        # with the user's actual monitor and matches the working configuration we tested.
         context_kwargs = {
             "user_agent": random.choice(USER_AGENTS),
-            "viewport": {"width": 1920, "height": 1080},
             "locale": "en-US",
             "timezone_id": "America/Denver",
             "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
