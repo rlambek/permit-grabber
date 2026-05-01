@@ -162,7 +162,9 @@ def click_book(page: Page):
         btn = page.get_by_role("button", name=label)
         if btn.count() > 0 and btn.first.is_enabled():
             btn.first.click()
-            page.wait_for_load_state("networkidle")
+            # networkidle never settles on recreation.gov — domcontentloaded is enough
+            # to know the cart page swapped in, and the email send doesn't need more.
+            page.wait_for_load_state("domcontentloaded")
             return
     raise RuntimeError("could not find a Book/Reserve/Continue button on the page")
 
