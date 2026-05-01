@@ -23,7 +23,7 @@ Write-Host ''
 Write-Host 'Launching browser. Watch the window — solve any MFA/CAPTCHA in it if prompted.' -ForegroundColor Yellow
 Write-Host ''
 
-$alert | python book_permit.py --alert-stdin
+$alert | python book_permit.py --alert-stdin --unattended
 
 Write-Host ''
 Write-Host 'Script exited. This window will stay open.' -ForegroundColor Green
