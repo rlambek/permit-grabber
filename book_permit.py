@@ -18,6 +18,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_playwright
+from playwright_stealth import Stealth
 
 from auth_store import clear_credentials, get_credentials, store_credentials
 import notify
@@ -258,10 +259,21 @@ def run(alert: dict, headless: bool, skip_precheck: bool, unattended: bool):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, args=LAUNCH_ARGS)
-        context_kwargs = {"user_agent": random.choice(USER_AGENTS)}
+        # Realistic context: full-HD viewport, US English, Mountain time (Yampa is in CO),
+        # explicit Accept-Language header. These eliminate easy fingerprint mismatches.
+        context_kwargs = {
+            "user_agent": random.choice(USER_AGENTS),
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+            "timezone_id": "America/Denver",
+            "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        }
         if AUTH_STATE.exists():
             context_kwargs["storage_state"] = str(AUTH_STATE)
         context = browser.new_context(**context_kwargs)
+        # playwright-stealth patches ~20 detection vectors (navigator.plugins/languages,
+        # WebGL vendor, chrome.runtime, etc.) — superset of the manual init script below.
+        Stealth().apply_stealth_sync(context)
         context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
 
