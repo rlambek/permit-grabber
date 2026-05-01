@@ -19,6 +19,9 @@ from pathlib import Path
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_playwright
 
+from auth_store import clear_credentials, get_credentials, store_credentials
+import notify
+
 AUTH_STATE = Path("auth.json")
 REQUIRED_FIELDS = ("permit_name", "permit_url", "date", "group_size")
 
@@ -26,10 +29,15 @@ REQUIRED_FIELDS = ("permit_name", "permit_url", "date", "group_size")
 # expects avoids the most obvious "automation tool" fingerprint without doing anything
 # evasive — same approach camply uses for its API calls.
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
 ]
+
+# Recreation.gov sniffs `navigator.webdriver` and the `AutomationControlled` blink feature
+# to flag Playwright as automation. These two patches together pass the basic checks.
+LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
+STEALTH_INIT_SCRIPT = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
 
 PERMIT_ID_RE = re.compile(r"/permits/(\d+)")
 
@@ -56,14 +64,13 @@ def load_alert(args) -> dict:
 
 
 def login_if_needed(page: Page):
-    email = os.environ.get("RECGOV_EMAIL")
-    password = os.environ.get("RECGOV_PASSWORD")
-    if not email or not password:
-        sys.exit("error: set RECGOV_EMAIL and RECGOV_PASSWORD environment variables")
-
     # If already authenticated, the header will show an account menu instead of "Log In".
     if page.get_by_role("button", name="Log In").count() == 0:
         return
+
+    email, password = get_credentials()
+    if not email or not password:
+        sys.exit("error: no recreation.gov credentials found. Run: python book_permit.py --store-creds")
 
     page.get_by_role("button", name="Log In").first.click()
     # Selectors confirmed via rmccrystal/recreation-gov-bot, which is a working Selenium bot.
@@ -78,44 +85,64 @@ def login_if_needed(page: Page):
     except PlaywrightTimeout:
         pass
 
-    page.wait_for_load_state("networkidle")
+    # Login is complete when the password field is removed from the DOM. networkidle is
+    # unreliable on recreation.gov — the SPA does background polling that never settles.
+    try:
+        page.locator("#rec-acct-sign-in-password").wait_for(state="detached", timeout=15000)
+    except PlaywrightTimeout:
+        pass
+
+
+def select_segment(page: Page, segment: str | None):
+    """Pick a permit segment/division if the page has the control.
+
+    Recreation.gov uses a native <select id="division-selection"> for river permits.
+    Some permit types may render a custom combobox instead — handled as a fallback.
+    """
+    if not segment:
+        return
+    elem = page.locator("#division-selection")
+    if elem.count() == 0:
+        return
+
+    tag = elem.evaluate("el => el.tagName")
+    if tag == "SELECT":
+        try:
+            elem.select_option(label=segment)
+            return
+        except PlaywrightTimeout:
+            pass
+        options = elem.locator("option").all_inner_texts()
+        for opt in options:
+            if segment.lower() in opt.lower():
+                elem.select_option(label=opt)
+                return
+        raise RuntimeError(f"No segment option matched {segment!r}. Available: {options}")
+
+    elem.click()
+    page.get_by_text(segment).first.click()
 
 
 def select_date(page: Page, iso_date: str):
     target = date.fromisoformat(iso_date)
-    # Strategy 1: a plain date input.
-    date_input = page.locator('input[type="date"], input[aria-label*="date" i]').first
-    if date_input.count() > 0:
-        try:
-            date_input.fill(iso_date)
-            return
-        except PlaywrightTimeout:
-            pass
-
-    # Strategy 2: open a date-picker trigger and click the day cell.
-    # TODO: verify selector — name varies by permit page ("Select Date", "Start Date", etc).
-    for trigger_name in ("Start Date", "Select Date", "Date"):
-        trigger = page.get_by_role("button", name=trigger_name)
-        if trigger.count() > 0:
-            trigger.first.click()
-            break
-
-    # Advance the calendar header until the displayed month matches our target.
+    # Recreation.gov permit pages use an inline calendar grid — no date <input>, no picker
+    # trigger button. We advance the visible month, then click the day cell.
     target_header = target.strftime("%B %Y")
     for _ in range(24):
         if page.get_by_text(target_header, exact=True).count() > 0:
             break
-        next_btn = page.get_by_role("button", name="Next Month")
+        next_btn = page.get_by_role("button", name="Next")
         if next_btn.count() == 0:
             break
         next_btn.first.click()
+        page.wait_for_timeout(250)
 
-    # Day cells on recreation.gov calendars are usually buttons with an aria-label like
-    # "Tuesday, July 15, 2026". Fall back to the day-of-month text if that fails.
-    aria_label = target.strftime("%A, %B %-d, %Y") if sys.platform != "win32" else target.strftime("%A, %B %#d, %Y")
-    cell = page.get_by_role("button", name=aria_label)
-    if cell.count() == 0:
-        cell = page.get_by_role("button", name=str(target.day), exact=True)
+    # Day buttons have aria-labels like "Sunday, August 16, 2026 - 5 left" or
+    # "...- Unavailable" or "Today, ...". Match the date prefix and ignore the suffix.
+    day_pattern = re.compile(
+        rf"^(?:Today, )?{target.strftime('%A')}, {target.strftime('%B')} {target.day}, {target.year}\b"
+    )
+    cell = page.get_by_role("button", name=day_pattern)
     cell.first.click()
 
 
@@ -181,7 +208,25 @@ def precheck_availability(permit_url: str, iso_date: str) -> bool | None:
     return False
 
 
-def run(alert: dict, headless: bool, skip_precheck: bool):
+def notify_cart_ready(alert: dict, current_url: str) -> None:
+    subject = f"Permit in cart: {alert['permit_name']} - {alert['date']}"
+    body = (
+        f"The booking script placed this permit in your recreation.gov cart:\n\n"
+        f"  Permit:     {alert['permit_name']}\n"
+        f"  Segment:    {alert.get('segment', '(none)')}\n"
+        f"  Date:       {alert['date']}\n"
+        f"  Group size: {alert['group_size']}\n\n"
+        f"Cart URL: {current_url}\n\n"
+        f"Recreation.gov holds carts for ~15 minutes — finish payment before then."
+    )
+    try:
+        notify.send_self_email(subject, body)
+        print("notify: emailed you about the cart")
+    except Exception as exc:
+        print(f"notify: failed to send email ({exc})")
+
+
+def run(alert: dict, headless: bool, skip_precheck: bool, unattended: bool):
     if not skip_precheck:
         available = precheck_availability(alert["permit_url"], alert["date"])
         if available is False:
@@ -193,11 +238,12 @@ def run(alert: dict, headless: bool, skip_precheck: bool):
             print("precheck: availability confirmed, launching browser")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        browser = p.chromium.launch(headless=headless, args=LAUNCH_ARGS)
         context_kwargs = {"user_agent": random.choice(USER_AGENTS)}
         if AUTH_STATE.exists():
             context_kwargs["storage_state"] = str(AUTH_STATE)
         context = browser.new_context(**context_kwargs)
+        context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
 
         page.goto(alert["permit_url"], wait_until="domcontentloaded")
@@ -210,6 +256,7 @@ def run(alert: dict, headless: bool, skip_precheck: bool):
         if "/permits/" not in page.url:
             page.goto(alert["permit_url"], wait_until="domcontentloaded")
 
+        select_segment(page, alert.get("segment"))
         select_date(page, alert["date"])
         set_group_size(page, int(alert["group_size"]))
         click_book(page)
@@ -217,7 +264,19 @@ def run(alert: dict, headless: bool, skip_precheck: bool):
         print(f"READY FOR HUMAN — review cart and confirm payment for {alert['permit_name']} on {alert['date']}")
         print(f"alert received: {alert.get('alert_received_at', 'unknown')}")
         print(f"current page: {page.url}")
-        input("Press Enter to close the browser when done...")
+        notify_cart_ready(alert, page.url)
+
+        if unattended:
+            # Recreation.gov holds carts for ~15 minutes. Sleep just under that so the browser
+            # window stays open long enough for a human to act on the email.
+            print("unattended mode: holding browser for 14 minutes, then closing")
+            try:
+                import time
+                time.sleep(14 * 60)
+            except KeyboardInterrupt:
+                pass
+        else:
+            input("Press Enter to close the browser when done...")
 
         context.close()
         browser.close()
@@ -225,15 +284,27 @@ def run(alert: dict, headless: bool, skip_precheck: bool):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--alert", help="Alert payload as a JSON string")
-    src.add_argument("--alert-stdin", action="store_true", help="Read JSON alert from stdin")
+    parser.add_argument("--alert", help="Alert payload as a JSON string")
+    parser.add_argument("--alert-stdin", action="store_true", help="Read JSON alert from stdin")
     parser.add_argument("--headless", action="store_true", help="Run browser hidden (default: headed)")
     parser.add_argument("--no-precheck", action="store_true", help="Skip the public-API availability check")
+    parser.add_argument("--unattended", action="store_true", help="Don't wait for Enter; hold browser 14 min then exit")
+    parser.add_argument("--store-creds", action="store_true", help="Prompt for and store recreation.gov credentials in the OS keyring")
+    parser.add_argument("--clear-creds", action="store_true", help="Remove stored recreation.gov credentials")
     args = parser.parse_args()
 
+    if args.store_creds:
+        store_credentials()
+        return
+    if args.clear_creds:
+        clear_credentials()
+        return
+
+    if not (args.alert or args.alert_stdin):
+        parser.error("one of --alert, --alert-stdin, --store-creds, or --clear-creds is required")
+
     alert = load_alert(args)
-    run(alert, headless=args.headless, skip_precheck=args.no_precheck)
+    run(alert, headless=args.headless, skip_precheck=args.no_precheck, unattended=args.unattended)
 
 
 if __name__ == "__main__":

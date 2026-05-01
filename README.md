@@ -32,12 +32,13 @@ playwright install chromium
 
 ### Recreation.gov credentials
 
-Set as environment variables — the script never logs them:
+Stored in your OS keyring (Windows Credential Manager / macOS Keychain / Linux Secret Service) — never written to disk in plaintext. One-time setup:
 
 ```bash
-set RECGOV_EMAIL=you@example.com
-set RECGOV_PASSWORD=...
+python book_permit.py --store-creds
 ```
+
+To remove: `python book_permit.py --clear-creds`. To override per-run, the env vars `RECGOV_EMAIL` / `RECGOV_PASSWORD` still take precedence over the keyring.
 
 ### Permit config (optional but recommended)
 
@@ -56,7 +57,15 @@ The scanner falls back to these values when the email lacks them.
 
 ## Usage
 
-One-shot scan, pipe to booking script:
+Fully unattended: scan, book, email yourself when at the cart:
+
+```bash
+python scan_alerts.py | python book_permit.py --alert-stdin --unattended
+```
+
+`--unattended` skips the "Press Enter" prompt and holds the browser for 14 minutes (one minute under recreation.gov's ~15-minute cart hold). When the cart is ready, the script sends an email to your own Gmail address — pay from any device before the timer expires.
+
+One-shot scan, pipe to booking script (interactive):
 
 ```bash
 python scan_alerts.py | python book_permit.py --alert-stdin
@@ -91,3 +100,7 @@ Run once headed (`without --headless`) against a real permit page and tighten an
 ## Processed-alert tracking
 
 The scanner adds the Gmail label `campflare-processed` to alerts it emits, so the same alert isn't booked twice. Remove the label manually to re-process.
+
+## Cart-ready notification
+
+When `book_permit.py` reaches the cart it sends a Gmail email to the address that authorized `scan_alerts.py` (using the same OAuth token — the `gmail.modify` scope already covers send). The email contains the permit, segment, date, group size, and current cart URL. If you didn't run `scan_alerts.py` yet (so `token.json` doesn't exist), the booking still works but you'll get a one-line warning instead of an email.

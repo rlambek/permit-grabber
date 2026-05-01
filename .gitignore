@@ -2,6 +2,7 @@ credentials.json
 token.json
 auth.json
 permit_config.json
+permit_page.png
 __pycache__/
 *.pyc
 .venv/
