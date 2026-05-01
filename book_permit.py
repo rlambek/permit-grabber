@@ -160,21 +160,45 @@ def select_date(page: Page, iso_date: str):
 def set_group_size(page: Page, group_size: int):
     """Fill a group-size input if the page has one.
 
-    Permits with simple party-count fields (campsites, day-use) get auto-filled. Permits
-    that require a participant list with birthdates (river permits, hunting tags) don't
-    expose a single number input — the script warns and leaves it for the human, since
-    the participant list is PII we shouldn't autofill anyway.
+    Recreation.gov uses several patterns: a native <input>, a React-Aria NumberField
+    (a role=group div wrapping a hidden/styled input), or a custom +/- spinbutton.
+    We try in order: native fill, then drill into the wrapper for an inner input, then
+    a spinbutton role. If none work, warn — the slot is already held; the human can
+    enter the size in the form.
     """
     if group_size <= 1:
         return
-    for label in ("Group Size", "Number of People", "Party Size", "Number of Participants",
-                  "Party size", "Group size", "Total in Party", "Number of guests"):
+    labels = ("Group Size", "Number of People", "Party Size", "Number of Participants",
+              "Party size", "Group size", "Total in Party", "Number of guests",
+              "Total Group Size")
+    for label in labels:
         field = page.get_by_label(label)
-        if field.count() > 0:
+        if field.count() == 0:
+            continue
+        # Strategy 1: native input that .fill() can handle directly.
+        try:
             field.first.fill(str(group_size))
             return
+        except Exception:
+            pass
+        # Strategy 2: NumberField wrapper — actual input lives inside.
+        inner = field.first.locator("input").first
+        if inner.count() > 0:
+            try:
+                inner.fill(str(group_size))
+                return
+            except Exception:
+                pass
+        # Strategy 3: spinbutton role inside the wrapper.
+        spin = field.first.get_by_role("spinbutton")
+        if spin.count() > 0:
+            try:
+                spin.first.fill(str(group_size))
+                return
+            except Exception:
+                pass
     print(
-        f"set_group_size: no simple group-size input on this page; group_size={group_size} "
+        f"set_group_size: could not auto-fill a group-size field; group_size={group_size} "
         "must be entered manually in the reservation form."
     )
 
