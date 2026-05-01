@@ -158,17 +158,24 @@ def select_date(page: Page, iso_date: str):
 
 
 def set_group_size(page: Page, group_size: int):
+    """Fill a group-size input if the page has one.
+
+    Permits with simple party-count fields (campsites, day-use) get auto-filled. Permits
+    that require a participant list with birthdates (river permits, hunting tags) don't
+    expose a single number input — the script warns and leaves it for the human, since
+    the participant list is PII we shouldn't autofill anyway.
+    """
     if group_size <= 1:
         return
-    # TODO: verify selector — group-size inputs vary by permit type.
-    for label in ("Group Size", "Number of People", "Party Size"):
+    for label in ("Group Size", "Number of People", "Party Size", "Number of Participants",
+                  "Party size", "Group size", "Total in Party", "Number of guests"):
         field = page.get_by_label(label)
         if field.count() > 0:
             field.first.fill(str(group_size))
             return
-    raise RuntimeError(
-        f"Could not find a group-size input on the page (expected group_size={group_size}). "
-        "Refusing to silently book with the default size."
+    print(
+        f"set_group_size: no simple group-size input on this page; group_size={group_size} "
+        "must be entered manually in the reservation form."
     )
 
 
@@ -229,15 +236,16 @@ def precheck_availability(permit_url: str, iso_date: str) -> bool | None:
 
 
 def notify_cart_ready(alert: dict, current_url: str) -> None:
-    subject = f"Permit in cart: {alert['permit_name']} - {alert['date']}"
+    subject = f"Permit ready to book: {alert['permit_name']} - {alert['date']}"
     body = (
-        f"The booking script placed this permit in your recreation.gov cart:\n\n"
+        f"The booking script reached the recreation.gov reservation page for:\n\n"
         f"  Permit:     {alert['permit_name']}\n"
         f"  Segment:    {alert.get('segment', '(none)')}\n"
         f"  Date:       {alert['date']}\n"
-        f"  Group size: {alert['group_size']}\n\n"
-        f"Cart URL: {current_url}\n\n"
-        f"Recreation.gov holds carts for ~15 minutes — finish payment before then."
+        f"  Group size: {alert['group_size']} (enter in the form)\n\n"
+        f"Page URL: {current_url}\n\n"
+        f"Complete the participant list, watercraft, and any other required fields, then\n"
+        f"submit and pay. The browser window is open on the local machine for ~15 minutes."
     )
     try:
         notify.send_self_email(subject, body)
@@ -289,10 +297,14 @@ def run(alert: dict, headless: bool, skip_precheck: bool, unattended: bool):
 
         select_segment(page, alert.get("segment"))
         select_date(page, alert["date"])
-        set_group_size(page, int(alert["group_size"]))
+        # Click "Book Now" on the permit page — navigates to the reservation form. For
+        # permits with a simple party-count input the next call sets it; for participant-
+        # list permits (river/hunting) it warns and the human fills the form.
         click_book(page)
+        page.wait_for_timeout(2000)
+        set_group_size(page, int(alert["group_size"]))
 
-        print(f"READY FOR HUMAN — review cart and confirm payment for {alert['permit_name']} on {alert['date']}")
+        print(f"READY FOR HUMAN — complete reservation form for {alert['permit_name']} on {alert['date']}")
         print(f"alert received: {alert.get('alert_received_at', 'unknown')}")
         print(f"current page: {page.url}")
         notify_cart_ready(alert, page.url)
