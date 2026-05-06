@@ -6,13 +6,16 @@ Usage:
     python scan_alerts.py | python book_permit.py --alert-stdin
 
 First run opens a browser for Google OAuth and writes token.json next to credentials.json.
-Processed alerts get the Gmail label "campflare-processed" so they aren't re-emitted.
+EVERY Campflare email gets the Gmail label "campflare-processed" so we never re-attempt
+the same one — even if it doesn't trigger a booking. Booking fires only when the body
+contains a recreation.gov permit URL listed in permit_config.json.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
 import json
 import os
 import re
@@ -92,41 +95,14 @@ def header(payload: dict, name: str) -> str:
     return ""
 
 
-# Format inferred from the observed Campflare confirmation email body, which uses
-# "Permit: <name>" and "Start Date(s): <iso list>". We assume the actual "found" alert
-# follows the same convention and includes a recreation.gov URL — the URL bit is a guess.
-PERMIT_NAME_RE = re.compile(r"^\s*Permit:\s*(.+?)\s*$", re.MULTILINE)
-DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-RECGOV_URL_RE = re.compile(r"https?://(?:www\.)?recreation\.gov/[^\s)>\]]+")
-
-
-def parse_alert(subject: str, body: str, received_iso: str) -> dict | None:
-    permit_match = PERMIT_NAME_RE.search(body)
-    permit_name = permit_match.group(1).strip() if permit_match else subject.replace("Campflare Permit Alert", "").strip(" -:")
-    if not permit_name:
-        return None
-
-    dates = DATE_RE.findall(body)
-    if not dates:
-        return None
-
-    url_match = RECGOV_URL_RE.search(body)
-    permit_url = url_match.group(0) if url_match else lookup_permit_url(permit_name)
-    if not permit_url:
-        # Without a permit URL we can't drive the booking script. Surface a clear payload anyway
-        # so the operator can see what was missing.
-        permit_url = ""
-
-    group_size = lookup_group_size(permit_name)
-
-    return {
-        "permit_name": permit_name,
-        "permit_url": permit_url,
-        "date": dates[0],
-        "candidate_dates": dates,
-        "group_size": group_size,
-        "alert_received_at": received_iso,
-    }
+# Date extraction: try ISO YYYY-MM-DD first (the format Campflare's confirmation emails
+# use), then fall back to "Month DayTH" with year inferred from the email's received date.
+ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+VERBOSE_DATE_RE = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+    re.IGNORECASE,
+)
 
 
 def _load_permit_config() -> dict:
@@ -135,14 +111,51 @@ def _load_permit_config() -> dict:
     return {}
 
 
-def lookup_permit_url(permit_name: str) -> str:
-    cfg = _load_permit_config().get(permit_name, {})
-    return cfg.get("permit_url", "")
+def extract_date(body: str, email_received_iso: str) -> str | None:
+    iso_matches = ISO_DATE_RE.findall(body)
+    if iso_matches:
+        return iso_matches[0]
+
+    try:
+        email_date = dt.date.fromisoformat(email_received_iso[:10])
+    except ValueError:
+        email_date = dt.date.today()
+
+    for month_name, day_str in VERBOSE_DATE_RE.findall(body):
+        try:
+            month_num = dt.datetime.strptime(month_name.title(), "%B").month
+            day = int(day_str)
+            candidate = dt.date(email_date.year, month_num, day)
+            if candidate < email_date:
+                candidate = candidate.replace(year=email_date.year + 1)
+            return candidate.isoformat()
+        except ValueError:
+            continue
+    return None
 
 
-def lookup_group_size(permit_name: str) -> int:
-    cfg = _load_permit_config().get(permit_name, {})
-    return int(cfg.get("group_size", 1))
+def parse_alert(subject: str, body: str, received_iso: str) -> dict | None:
+    """Return a booking payload if the body matches a configured permit URL, else None."""
+    config = _load_permit_config()
+    matched_url = next((url for url in config if url in body), None)
+    if not matched_url:
+        return None
+
+    date_str = extract_date(body, received_iso)
+    if not date_str:
+        # Recognised permit but no parseable date — the booker can't proceed without one.
+        # Caller will still mark this email processed; user can inspect manually.
+        return None
+
+    cfg = config[matched_url]
+    return {
+        "permit_name": cfg.get("name", subject),
+        "permit_url": matched_url,
+        "segment": cfg.get("segment"),
+        "date": date_str,
+        "group_size": int(cfg.get("group_size", 1)),
+        "alert_received_at": received_iso,
+    }
 
 
 def mark_processed(service, message_id: str, label_id: str):
@@ -166,7 +179,9 @@ def scan_once(service, label_id: str) -> list[dict]:
         parsed = parse_alert(subject, body, received_iso)
         if parsed:
             payloads.append(parsed)
-            mark_processed(service, msg_meta["id"], label_id)
+        # Always mark processed — even if the alert wasn't bookable. Otherwise we'd
+        # re-fetch and re-attempt the same email every poll cycle indefinitely.
+        mark_processed(service, msg_meta["id"], label_id)
     return payloads
 
 
